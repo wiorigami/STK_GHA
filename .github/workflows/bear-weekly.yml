@@ -1,0 +1,101 @@
+name: bear-weekly-epub
+
+on:
+  schedule:
+    # UTC 週六 00:00 = 北京/台北時間(CST, UTC+8) 週六 08:00
+    - cron: "0 0 * * 6"
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install calibre & ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y calibre ffmpeg
+          ebook-convert --version
+
+      - name: Fetch & build EPUB
+        run: python3 bear_weekly.py
+
+      - name: Upload EPUB artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bear-auto-epub
+          path: output/*.epub
+          if-no-files-found: error
+          retention-days: 90
+
+      # ─────────────────────────────────────────────────────────────
+      #  送到 Kindle（裝置憑證模式）
+      #  需要 Secrets：STK_DEVICE_PRIVATE_KEY / STK_ADP_TOKEN
+      # ─────────────────────────────────────────────────────────────
+
+      - name: Install Kindle sender
+        run: pip install --quiet requests stkclient
+
+      - name: Send to Kindle
+        env:
+          STK_DEVICE_PRIVATE_KEY: ${{ secrets.STK_DEVICE_PRIVATE_KEY }}
+          STK_ADP_TOKEN: ${{ secrets.STK_ADP_TOKEN }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          FILES=(output/*.epub)
+          if [ ${#FILES[@]} -eq 0 ]; then
+            echo "::error::output/ 底下找不到 epub，建置步驟可能失敗了"
+            exit 1
+          fi
+
+          # 台北時間的日期。用 Python 算，Linux / macOS 都能跑
+          # （date -d 是 GNU 專有，macOS 的 BSD date 不支援）
+          STAMP=$(python3 -c "import datetime as d; print((d.datetime.now(d.timezone.utc)+d.timedelta(hours=8)).strftime('%Y-%m-%d'))")
+          TITLE="Bear Blog 中文週報 ${STAMP}"
+
+          echo "要送的檔案：${FILES[*]}"
+          echo "書名：${TITLE}"
+
+          python3 stk_device_send.py \
+            --archive \
+            --title "${TITLE}" \
+            --author "Bear 週報" \
+            "${FILES[@]}"
+
+      - name: 失敗時提示
+        if: failure()
+        run: |
+          {
+            echo "### ❌ Bear 週報傳送失敗"
+            echo ""
+            echo "先檢查是哪個步驟失敗："
+            echo ""
+            echo "| 步驟 | 常見原因 |"
+            echo "|---|---|"
+            echo "| Install calibre & ffmpeg | apt 來源暫時異常，重跑一次通常就好 |"
+            echo "| Fetch & build EPUB | bearblog.dev 連不上，或當週文章不足 |"
+            echo "| Upload EPUB artifact | \`output/\` 底下沒有 epub |"
+            echo "| Send to Kindle | 憑證問題，見下 |"
+            echo ""
+            echo "**Send to Kindle 失敗的話：**"
+            echo ""
+            echo "1. 確認這兩個 Secrets 存在且名稱正確："
+            echo "   \`STK_DEVICE_PRIVATE_KEY\`、\`STK_ADP_TOKEN\`"
+            echo "2. \`STK_DEVICE_PRIVATE_KEY\` 必須是完整 PEM，含這兩行："
+            echo '   ```'
+            echo "   -----BEGIN RSA PRIVATE KEY-----"
+            echo "   -----END RSA PRIVATE KEY-----"
+            echo '   ```'
+            echo "3. 憑證若被撤銷（Amazon 裝置列表裡刪掉了），"
+            echo "   在本機重跑 \`python3 stk_device_setup.py\` 取得新的"
+            echo ""
+            echo "> EPUB 已經上傳到 Artifact，就算傳送失敗也不會遺失。"
+          } >> "$GITHUB_STEP_SUMMARY"
